@@ -6,13 +6,49 @@ param(
     [int]$RefreshInterval = 2,
     [switch]$Verbose,
     [switch]$VerbosePrompt,
-    [switch]$ShowGenerationDetails
+    [switch]$ShowGenerationDetails,
+    [string]$EventLogPath = "$HOME/.ollama_monitor_events.json",
+    [int]$MaxHistory = 200
 )
 
 # Track request history
-$script:RequestHistory = [System.Collections.Generic.List[PSCustomObject]]::new()
 $script:PreviousModels = @{}
-$script:MaxHistory = 50
+$script:MaxHistory = $MaxHistory
+
+# Load persistent event log
+function Load-EventLog {
+    if (Test-Path $EventLogPath) {
+        try {
+            $raw = Get-Content $EventLogPath -Raw | ConvertFrom-Json
+            $list = [System.Collections.Generic.List[PSCustomObject]]::new()
+            foreach ($entry in $raw) {
+                $list.Add([PSCustomObject]@{
+                    Time    = [DateTime]$entry.Time
+                    Model   = $entry.Model
+                    Event   = $entry.Event
+                    Details = $entry.Details
+                    Client  = if ($entry.Client) { $entry.Client } else { "" }
+                    Prompt  = if ($entry.Prompt) { $entry.Prompt } else { "" }
+                })
+            }
+            return $list
+        } catch {
+            return [System.Collections.Generic.List[PSCustomObject]]::new()
+        }
+    }
+    return [System.Collections.Generic.List[PSCustomObject]]::new()
+}
+
+function Save-EventLog {
+    try {
+        $script:RequestHistory | Select-Object Time, Model, Event, Details, Client, Prompt |
+            ConvertTo-Json -Depth 3 -Compress |
+            Set-Content $EventLogPath -Force
+    } catch {}
+}
+
+$script:RequestHistory = Load-EventLog
+$script:EventLogDirty = $false
 
 function Write-Header {
     $width = [Math]::Max(60, $Host.UI.RawUI.WindowSize.Width - 2)
@@ -90,36 +126,137 @@ function Format-Duration {
     return "{0:N0}s" -f $Duration.TotalSeconds
 }
 
+function Get-ConnectedClients {
+    # Parse the Ollama host to get the port
+    $uri = [Uri]$OllamaHost
+    $port = $uri.Port
+
+    $clients = @()
+    try {
+        # Use ss to find established TCP connections to the Ollama port
+        $ssOutput = & ss -tn state established "( dport = :$port or sport = :$port )" 2>/dev/null
+        foreach ($line in $ssOutput) {
+            if ($line -match '^\s*ESTAB' -or $line -match '^\d') {
+                # Parse ss output: State Recv-Q Send-Q Local:Port Peer:Port
+                $parts = $line.Trim() -split '\s+'
+                if ($parts.Count -ge 5) {
+                    $peer = $parts[4]
+                } elseif ($parts.Count -ge 4) {
+                    $peer = $parts[3]
+                } else {
+                    continue
+                }
+                # Extract IP from peer address (handle IPv6 bracket notation and IPv4)
+                if ($peer -match '^\[(.+)\]:(\d+)$') {
+                    $ip = $Matches[1]
+                    $peerPort = $Matches[2]
+                } elseif ($peer -match '^(.+):(\d+)$') {
+                    $ip = $Matches[1]
+                    $peerPort = $Matches[2]
+                } else {
+                    continue
+                }
+                # Skip our own monitor connections (we connect from ephemeral ports)
+                $clients += [PSCustomObject]@{
+                    IP   = $ip
+                    Port = $peerPort
+                    Peer = $peer
+                }
+            }
+        }
+    } catch {}
+    return $clients
+}
+
+function Get-OllamaRequestLog {
+    # Try to capture recent prompts from Ollama's journal logs
+    $requests = @()
+    try {
+        # Get last 60 seconds of ollama logs, look for request lines
+        $logs = & journalctl -u ollama --since "60 seconds ago" --no-pager -o cat 2>/dev/null
+        if ($logs) {
+            foreach ($line in $logs) {
+                # Ollama logs requests with prompt content
+                if ($line -match '"prompt"\s*:\s*"([^"]{1,200})') {
+                    $prompt = $Matches[1] -replace '\\n', ' '
+                    $requests += $prompt
+                }
+                # Also match the model being requested
+                if ($line -match '"model"\s*:\s*"([^"]+)"') {
+                    # just capture, we correlate elsewhere
+                }
+            }
+        }
+    } catch {}
+    return $requests
+}
+
 function Update-RequestHistory {
-    param($RunningModels)
+    param($RunningModels, $Clients)
 
     $now = Get-Date
     $currentModels = @{}
+
+    # Get recent prompts from logs
+    $recentPrompts = Get-OllamaRequestLog
+
+    # Build a client summary string
+    $clientSummary = if ($Clients -and $Clients.Count -gt 0) {
+        ($Clients | ForEach-Object { $_.IP } | Select-Object -Unique) -join ", "
+    } else { "" }
+
+    $promptSummary = if ($recentPrompts -and $recentPrompts.Count -gt 0) {
+        $p = $recentPrompts[-1]
+        if ($p.Length -gt 80) { $p.Substring(0, 80) + "..." } else { $p }
+    } else { "" }
 
     foreach ($model in $RunningModels) {
         $key = $model.name
         $currentModels[$key] = $true
 
         if (-not $script:PreviousModels.ContainsKey($key)) {
-            # New model loaded - a new connection started
             $script:RequestHistory.Add([PSCustomObject]@{
-                Time      = $now
-                Model     = $model.name
-                Event     = "LOADED"
-                Details   = "Size: $(Format-Bytes $model.size)"
+                Time    = $now
+                Model   = $model.name
+                Event   = "LOADED"
+                Details = "Size: $(Format-Bytes $model.size)"
+                Client  = $clientSummary
+                Prompt  = $promptSummary
             })
+            $script:EventLogDirty = $true
         }
     }
 
     foreach ($key in @($script:PreviousModels.Keys)) {
         if (-not $currentModels.ContainsKey($key)) {
-            # Model was unloaded
             $script:RequestHistory.Add([PSCustomObject]@{
-                Time      = $now
-                Model     = $key
-                Event     = "UNLOADED"
-                Details   = ""
+                Time    = $now
+                Model   = $key
+                Event   = "UNLOADED"
+                Details = ""
+                Client  = ""
+                Prompt  = ""
             })
+            $script:EventLogDirty = $true
+        }
+    }
+
+    # Track active request events (prompt activity on already-loaded models)
+    if ($promptSummary -and $clientSummary) {
+        $lastRequest = $script:RequestHistory | Where-Object { $_.Event -eq "REQUEST" } | Select-Object -Last 1
+        $isDuplicate = $lastRequest -and $lastRequest.Prompt -eq $promptSummary -and
+                       ($now - $lastRequest.Time).TotalSeconds -lt 10
+        if (-not $isDuplicate) {
+            $activeModel = if ($RunningModels.Count -gt 0) { $RunningModels[0].name } else { "unknown" }
+            $script:RequestHistory.Add([PSCustomObject]@{
+                Time    = $now
+                Model   = $activeModel
+                Event   = "REQUEST"
+                Details = ""
+                Client  = $clientSummary
+                Prompt  = $promptSummary
+            })
+            $script:EventLogDirty = $true
         }
     }
 
@@ -128,6 +265,12 @@ function Update-RequestHistory {
     # Trim history
     while ($script:RequestHistory.Count -gt $script:MaxHistory) {
         $script:RequestHistory.RemoveAt(0)
+    }
+
+    # Persist if changed
+    if ($script:EventLogDirty) {
+        Save-EventLog
+        $script:EventLogDirty = $false
     }
 }
 
@@ -200,6 +343,31 @@ function Write-Dashboard {
 
     Write-Host ""
 
+    # Connected clients section
+    $clients = Get-ConnectedClients
+    Write-Host "  CONNECTED CLIENTS ($($clients.Count))" -ForegroundColor Yellow
+    Write-Host $divider -ForegroundColor DarkGray
+
+    if ($clients.Count -eq 0) {
+        Write-Host "  (no active client connections)" -ForegroundColor DarkGray
+    } else {
+        $grouped = $clients | Group-Object IP
+        foreach ($group in $grouped) {
+            $connCount = $group.Count
+            $ports = ($group.Group | ForEach-Object { $_.Port }) -join ", "
+            Write-Host "  * " -ForegroundColor Green -NoNewline
+            Write-Host "$($group.Name)" -ForegroundColor White -NoNewline
+            Write-Host "  ($connCount connection$(if ($connCount -ne 1) {'s'}))" -ForegroundColor DarkGray -NoNewline
+            if ($Verbose) {
+                Write-Host "  ports: $ports" -ForegroundColor DarkGray
+            } else {
+                Write-Host ""
+            }
+        }
+    }
+
+    Write-Host ""
+
     # Available models section
     $available = $Status.AvailableModels
     Write-Host "  AVAILABLE MODELS ($($available.Count))" -ForegroundColor Cyan
@@ -243,17 +411,33 @@ function Write-Dashboard {
     # Event history section
     if ($script:RequestHistory.Count -gt 0) {
         Write-Host ""
-        Write-Host "  EVENT LOG (last $([Math]::Min(10, $script:RequestHistory.Count)))" -ForegroundColor Magenta
+        $showCount = [Math]::Min(15, $script:RequestHistory.Count)
+        Write-Host "  EVENT LOG (last $showCount of $($script:RequestHistory.Count) total | saved to $EventLogPath)" -ForegroundColor Magenta
         Write-Host $divider -ForegroundColor DarkGray
 
-        $recent = $script:RequestHistory | Select-Object -Last 10
+        $recent = $script:RequestHistory | Select-Object -Last 15
         foreach ($entry in $recent) {
-            $time = $entry.Time.ToString("HH:mm:ss")
-            $eventColor = if ($entry.Event -eq "LOADED") { "Green" } else { "DarkYellow" }
+            $time = $entry.Time.ToString("yyyy-MM-dd HH:mm:ss")
+            $eventColor = switch ($entry.Event) {
+                "LOADED"   { "Green" }
+                "UNLOADED" { "DarkYellow" }
+                "REQUEST"  { "Cyan" }
+                default    { "Gray" }
+            }
             $details = if ($entry.Details) { " - $($entry.Details)" } else { "" }
+            $client = if ($entry.Client) { " from $($entry.Client)" } else { "" }
+
             Write-Host "  [$time] " -ForegroundColor DarkGray -NoNewline
             Write-Host "$($entry.Event)" -ForegroundColor $eventColor -NoNewline
-            Write-Host " $($entry.Model)$details" -ForegroundColor White
+            Write-Host " $($entry.Model)$details$client" -ForegroundColor White
+
+            # Show prompt on a second line if present
+            if ($entry.Prompt -and ($VerbosePrompt -or $entry.Event -eq "REQUEST")) {
+                $promptDisplay = if ($entry.Prompt.Length -gt 100) {
+                    $entry.Prompt.Substring(0, 100) + "..."
+                } else { $entry.Prompt }
+                Write-Host "    prompt: $promptDisplay" -ForegroundColor DarkMagenta
+            }
         }
     }
 
@@ -268,7 +452,8 @@ try {
         $status = Get-OllamaStatus
 
         if ($status.Online) {
-            Update-RequestHistory -RunningModels $status.RunningModels
+            $clients = Get-ConnectedClients
+            Update-RequestHistory -RunningModels $status.RunningModels -Clients $clients
         }
 
         Write-Dashboard -Status $status
@@ -283,6 +468,7 @@ try {
     }
 } finally {
     [Console]::CursorVisible = $true
+    Save-EventLog
     Write-Host ""
-    Write-Host "Monitor stopped." -ForegroundColor Yellow
+    Write-Host "Monitor stopped. Event log saved to $EventLogPath" -ForegroundColor Yellow
 }
