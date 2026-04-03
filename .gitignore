@@ -1,0 +1,21 @@
+# AI assistant artifacts
+.aider*
+.claude
+
+# PowerShell
+*.psm1.bak
+*.ps1.bak
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Monitor data
+.ollama_monitor_events.json
