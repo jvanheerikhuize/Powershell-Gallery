@@ -4,7 +4,9 @@
 param(
     [string]$OllamaHost = "http://localhost:11434",
     [int]$RefreshInterval = 2,
-    [switch]$Verbose
+    [switch]$Verbose,
+    [switch]$VerbosePrompt,
+    [switch]$ShowGenerationDetails
 )
 
 # Track request history
@@ -21,6 +23,12 @@ function Write-Header {
     Write-Host ([string]([char]0x2551) + $title + (' ' * [Math]::Max(0, $padding)) + [char]0x2551) -ForegroundColor Cyan
     Write-Host ([char]0x255A + $border + [char]0x255D) -ForegroundColor Cyan
     Write-Host "  Host: $OllamaHost  |  Refresh: ${RefreshInterval}s  |  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  |  Ctrl+C to quit" -ForegroundColor DarkGray
+    if ($Verbose) {
+        Write-Host "  [VERBOSE MODE]" -ForegroundColor Yellow
+    }
+    if ($VerbosePrompt) {
+        Write-Host "  [PROMPT MONITORING ENABLED]" -ForegroundColor Magenta
+    }
     Write-Host ""
 }
 
@@ -44,6 +52,24 @@ function Get-OllamaStatus {
         RunningModels = if ($ps.models) { @($ps.models) } else { @() }
         AvailableModels = if ($tags -and $tags.models) { @($tags.models) } else { @() }
     }
+}
+
+function Get-OllamaGenerationStatus {
+    # Try to get generation progress info if available
+    $generationStatus = $null
+    
+    try {
+        # Check for active generations
+        $generationStatus = Invoke-RestMethod -Uri "$OllamaHost/api/generate" -Method Get -TimeoutSec 5 -ErrorAction Stop
+    } catch {
+        # Generation endpoint might not be available or no active generation
+        $generationStatus = @{
+            Active = $false
+            Message = "No active generation or endpoint not available"
+        }
+    }
+    
+    return $generationStatus
 }
 
 function Format-Bytes {
@@ -188,6 +214,26 @@ function Write-Dashboard {
             Write-Host "  $indicator " -ForegroundColor $color -NoNewline
             Write-Host "$($model.name)" -ForegroundColor White -NoNewline
             Write-Host "  ($size)" -ForegroundColor DarkGray
+        }
+    }
+
+    # Generation status section (if enabled)
+    if ($ShowGenerationDetails) {
+        Write-Host ""
+        Write-Host "  GENERATION STATUS" -ForegroundColor Magenta
+        Write-Host $divider -ForegroundColor DarkGray
+
+        $genStatus = Get-OllamaGenerationStatus
+        
+        if ($genStatus.Active) {
+            Write-Host "  [ACTIVE GENERATION]" -ForegroundColor Green
+            Write-Host "    Model: $($genStatus.model)" -ForegroundColor Gray
+            Write-Host "    Status: $($genStatus.status)" -ForegroundColor Gray
+            Write-Host "    Total Tokens: $($genStatus.total_duration)" -ForegroundColor Gray
+            Write-Host "    Prompt: $($genStatus.prompt)" -ForegroundColor DarkYellow
+            Write-Host "    Response: $($genStatus.response)" -ForegroundColor DarkYellow
+        } else {
+            Write-Host "  [NO ACTIVE GENERATION]" -ForegroundColor DarkGray
         }
     }
 
