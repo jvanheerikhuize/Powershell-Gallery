@@ -37,6 +37,11 @@ function Get-Timestamp {
 function Test-OllamaConnection {
     try {
         $response = Invoke-RestMethod -Uri "$OllamaHost/api/tags" -Method Get -ErrorAction Stop
+        if ($response -is [string]) {
+            Write-Host "✗ Ollama returned plain text response" -ForegroundColor Red
+            Write-Host "  Response: $response" -ForegroundColor Yellow
+            return $false
+        }
         Write-Host "✓ Ollama is running at $OllamaHost" -ForegroundColor Green
         return $true
     }
@@ -44,6 +49,29 @@ function Test-OllamaConnection {
         Write-Host "✗ Cannot connect to Ollama at $OllamaHost" -ForegroundColor Red
         Write-Host "  Make sure Ollama is running: ollama serve" -ForegroundColor Yellow
         return $false
+    }
+}
+
+# Get available models with better error handling
+function Get-Available-Models {
+    try {
+        $response = Invoke-RestMethod -Uri "$OllamaHost/api/tags" -Method Get -ErrorAction Stop
+        if ($response -is [string]) {
+            Write-Host "  Ollama returned plain text: $response" -ForegroundColor Yellow
+            return $null
+        }
+        if ($response.Models) {
+            Write-Host "Available Models:" -ForegroundColor Cyan
+            $response.Models | ForEach-Object {
+                Write-Host "  - $_.Name" -ForegroundColor Gray
+            }
+            return $response.Models
+        }
+        return $null
+    }
+    catch {
+        Write-Host "Error fetching models: $_" -ForegroundColor Red
+        return $null
     }
 }
 
@@ -122,17 +150,7 @@ function Start-Monitoring {
         }
         
         # Get available models
-        try {
-            $models = Invoke-RestMethod -Uri "$OllamaHost/api/tags" -Method Get | ConvertFrom-Json
-            Write-Host "Available Models:" -ForegroundColor Cyan
-            $models.Models | ForEach-Object {
-                Write-Host "  - $_.Name" -ForegroundColor Gray
-            }
-            Write-Host ""
-        }
-        catch {
-            Write-Host "Error fetching models: $_" -ForegroundColor Red
-        }
+        Get-Available-Models
         
         # Monitor request
         Monitor-Request -Model $Model -Prompt $Prompt
