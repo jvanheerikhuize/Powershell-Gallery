@@ -1,171 +1,239 @@
 # Ollama Live Request Monitor
-# Monitors Ollama API requests and displays live updates in the CLI
+# Monitors active Ollama connections and displays live updates in the CLI
 
 param(
     [string]$OllamaHost = "http://localhost:11434",
-    [string]$Model = "llama2",
-    [string]$Prompt = "Hello, how are you?",
-    [switch]$WatchMode = $true,
-    [switch]$Verbose = $false
+    [int]$RefreshInterval = 2,
+    [switch]$Verbose
 )
 
-# Colors for terminal output
-$Colors = @{
-    Green = "Green"
-    Yellow = "Yellow"
-    Red = "Red"
-    Cyan = "Cyan"
-    White = "White"
-    Blue = "Blue"
+# Track request history
+$script:RequestHistory = [System.Collections.Generic.List[PSCustomObject]]::new()
+$script:PreviousModels = @{}
+$script:MaxHistory = 50
+
+function Write-Header {
+    $width = [Math]::Max(60, $Host.UI.RawUI.WindowSize.Width - 2)
+    $border = [string]::new([char]0x2550, $width - 2)
+    Write-Host ([char]0x2554 + $border + [char]0x2557) -ForegroundColor Cyan
+    $title = "  OLLAMA LIVE CONNECTION MONITOR"
+    $padding = $width - 2 - $title.Length
+    Write-Host ([string]([char]0x2551) + $title + (' ' * [Math]::Max(0, $padding)) + [char]0x2551) -ForegroundColor Cyan
+    Write-Host ([char]0x255A + $border + [char]0x255D) -ForegroundColor Cyan
+    Write-Host "  Host: $OllamaHost  |  Refresh: ${RefreshInterval}s  |  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  |  Ctrl+C to quit" -ForegroundColor DarkGray
+    Write-Host ""
 }
 
-# Clear screen and set title
-function Clear-Screen {
+function Get-OllamaStatus {
+    # Fetch running models (active connections) and available models in parallel
+    $ps = $null
+    $tags = $null
+
+    try {
+        $ps = Invoke-RestMethod -Uri "$OllamaHost/api/ps" -Method Get -TimeoutSec 5 -ErrorAction Stop
+    } catch {
+        return @{ Online = $false; Error = $_.Exception.Message }
+    }
+
+    try {
+        $tags = Invoke-RestMethod -Uri "$OllamaHost/api/tags" -Method Get -TimeoutSec 5 -ErrorAction Stop
+    } catch {}
+
+    return @{
+        Online = $true
+        RunningModels = if ($ps.models) { @($ps.models) } else { @() }
+        AvailableModels = if ($tags -and $tags.models) { @($tags.models) } else { @() }
+    }
+}
+
+function Format-Bytes {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return "{0:N1} GB" -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return "{0:N1} MB" -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return "{0:N1} KB" -f ($Bytes / 1KB) }
+    return "$Bytes B"
+}
+
+function Format-Duration {
+    param([TimeSpan]$Duration)
+    if ($Duration.TotalHours -ge 1) { return "{0:N0}h {1:N0}m" -f $Duration.TotalHours, $Duration.Minutes }
+    if ($Duration.TotalMinutes -ge 1) { return "{0:N0}m {1:N0}s" -f $Duration.TotalMinutes, $Duration.Seconds }
+    return "{0:N0}s" -f $Duration.TotalSeconds
+}
+
+function Update-RequestHistory {
+    param($RunningModels)
+
+    $now = Get-Date
+    $currentModels = @{}
+
+    foreach ($model in $RunningModels) {
+        $key = $model.name
+        $currentModels[$key] = $true
+
+        if (-not $script:PreviousModels.ContainsKey($key)) {
+            # New model loaded - a new connection started
+            $script:RequestHistory.Add([PSCustomObject]@{
+                Time      = $now
+                Model     = $model.name
+                Event     = "LOADED"
+                Details   = "Size: $(Format-Bytes $model.size)"
+            })
+        }
+    }
+
+    foreach ($key in @($script:PreviousModels.Keys)) {
+        if (-not $currentModels.ContainsKey($key)) {
+            # Model was unloaded
+            $script:RequestHistory.Add([PSCustomObject]@{
+                Time      = $now
+                Model     = $key
+                Event     = "UNLOADED"
+                Details   = ""
+            })
+        }
+    }
+
+    $script:PreviousModels = $currentModels
+
+    # Trim history
+    while ($script:RequestHistory.Count -gt $script:MaxHistory) {
+        $script:RequestHistory.RemoveAt(0)
+    }
+}
+
+function Write-Dashboard {
+    param($Status)
+
     Clear-Host
-    Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║  OLLAMA LIVE REQUEST MONITOR                                 ║" -ForegroundColor Cyan
-    Write-Host "╚════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
-    Write-Host ""
-}
+    Write-Header
 
-# Get current timestamp
-function Get-Timestamp {
-    return (Get-Date -Format "HH:mm:ss")
-}
-
-# Check if Ollama is running
-function Test-OllamaConnection {
-    try {
-        $response = Invoke-RestMethod -Uri "$OllamaHost/api/tags" -Method Get -ErrorAction Stop
-        if ($response -is [string]) {
-            Write-Host "✗ Ollama returned plain text response" -ForegroundColor Red
-            Write-Host "  Response: $response" -ForegroundColor Yellow
-            return $false
-        }
-        Write-Host "✓ Ollama is running at $OllamaHost" -ForegroundColor Green
-        return $true
-    }
-    catch {
-        Write-Host "✗ Cannot connect to Ollama at $OllamaHost" -ForegroundColor Red
+    if (-not $Status.Online) {
+        Write-Host "  [OFFLINE] Cannot connect to Ollama" -ForegroundColor Red
+        Write-Host "  Error: $($Status.Error)" -ForegroundColor DarkRed
+        Write-Host ""
         Write-Host "  Make sure Ollama is running: ollama serve" -ForegroundColor Yellow
-        return $false
-    }
-}
-
-# Get available models with better error handling
-function Get-Available-Models {
-    try {
-        $response = Invoke-RestMethod -Uri "$OllamaHost/api/tags" -Method Get -ErrorAction Stop
-        if ($response -is [string]) {
-            Write-Host "  Ollama returned plain text: $response" -ForegroundColor Yellow
-            return $null
-        }
-        if ($response.Models) {
-            Write-Host "Available Models:" -ForegroundColor Cyan
-            $response.Models | ForEach-Object {
-                Write-Host "  - $_.Name" -ForegroundColor Gray
-            }
-            return $response.Models
-        }
-        return $null
-    }
-    catch {
-        Write-Host "Error fetching models: $_" -ForegroundColor Red
-        return $null
-    }
-}
-
-# Monitor a single request
-function Monitor-Request {
-    param(
-        [string]$Model,
-        [string]$Prompt
-    )
-    
-    $startTime = Get-Date
-    $requestId = [Guid]::NewGuid().ToString().Substring(0, 8)
-    
-    Write-Host ""
-    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
-    Write-Host "  REQUEST ID: $requestId" -ForegroundColor Cyan
-    Write-Host "  MODEL: $Model" -ForegroundColor Cyan
-    Write-Host "  TIMESTAMP: $(Get-Timestamp)" -ForegroundColor Cyan
-    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
-    Write-Host ""
-    
-    # Send request to Ollama with streaming
-    $response = Invoke-RestMethod -Uri "$OllamaHost/api/generate" -Method Post -ContentType "application/json" -Body @{
-        model = $Model
-        prompt = $Prompt
-        stream = $true
-    } | ConvertFrom-Json
-    
-    # Process streaming response
-    $output = ""
-    $elapsed = (Get-Date) - $startTime
-    $elapsedStr = [math]::Round($elapsed.TotalSeconds, 2)
-    
-    if ($response.Stream) {
-        $response.Stream | ForEach-Object {
-            $data = $_ | ConvertFrom-Json
-            $output += $data.Response
-            Write-Host "  [STREAMING] $output" -ForegroundColor Green -NoNewline
-            Write-Host "  (elapsed: $elapsedStr s)" -ForegroundColor Gray
-            Start-Sleep -Milliseconds 10
-        }
-    }
-    else {
-        $output = $response.Response
-        Write-Host "  [COMPLETE] $output" -ForegroundColor Green
-        Write-Host "  (elapsed: $elapsedStr s)" -ForegroundColor Gray
-    }
-    
-    Write-Host ""
-    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
-    Write-Host "  STATUS: COMPLETED" -ForegroundColor Green
-    Write-Host "  DURATION: $elapsedStr s" -ForegroundColor Yellow
-    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
-    Write-Host ""
-}
-
-# Main monitoring loop
-function Start-Monitoring {
-    if (-not $WatchMode) {
-        Monitor-Request -Model $Model -Prompt $Prompt
         return
     }
-    
-    Write-Host "Starting live monitoring mode..." -ForegroundColor Cyan
-    Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
+
+    Write-Host "  SERVER STATUS: ONLINE" -ForegroundColor Green
     Write-Host ""
-    
-    while ($true) {
-        Clear-Screen
-        
-        # Check connection
-        if (-not (Test-OllamaConnection)) {
-            Write-Host "Waiting for Ollama to be available..." -ForegroundColor Yellow
-            Start-Sleep -Seconds 5
-            continue
+
+    # Active connections section
+    $running = $Status.RunningModels
+    $divider = "  " + ("-" * 56)
+
+    Write-Host "  ACTIVE CONNECTIONS ($($running.Count))" -ForegroundColor Yellow
+    Write-Host $divider -ForegroundColor DarkGray
+
+    if ($running.Count -eq 0) {
+        Write-Host "  (no active connections)" -ForegroundColor DarkGray
+    } else {
+        foreach ($model in $running) {
+            $name = $model.name
+            $size = Format-Bytes $model.size
+            $vramSize = if ($model.size_vram) { Format-Bytes $model.size_vram } else { "N/A" }
+
+            # Calculate how long the model has been loaded
+            $expiresAt = $null
+            $runningFor = ""
+            if ($model.expires_at) {
+                try {
+                    $expiresAt = [DateTimeOffset]::Parse($model.expires_at)
+                    $remaining = $expiresAt - [DateTimeOffset]::Now
+                    if ($remaining.TotalSeconds -gt 0) {
+                        $runningFor = "expires in $(Format-Duration $remaining)"
+                    } else {
+                        $runningFor = "expiring..."
+                    }
+                } catch {
+                    $runningFor = ""
+                }
+            }
+
+            $details = $model.details
+            $quantization = if ($details.quantization_level) { $details.quantization_level } else { "" }
+            $family = if ($details.family) { $details.family } else { "" }
+            $paramSize = if ($details.parameter_size) { $details.parameter_size } else { "" }
+
+            Write-Host "  * " -ForegroundColor Green -NoNewline
+            Write-Host "$name" -ForegroundColor White -NoNewline
+            Write-Host "  [$paramSize $family $quantization]" -ForegroundColor DarkGray
+
+            Write-Host "    RAM: $size  |  VRAM: $vramSize" -ForegroundColor Gray -NoNewline
+            if ($runningFor) {
+                Write-Host "  |  $runningFor" -ForegroundColor DarkYellow
+            } else {
+                Write-Host ""
+            }
         }
-        
-        # Get available models
-        Get-Available-Models
-        
-        # Monitor request
-        Monitor-Request -Model $Model -Prompt $Prompt
-        
-        # Wait before next request
-        Start-Sleep -Seconds 5
     }
+
+    Write-Host ""
+
+    # Available models section
+    $available = $Status.AvailableModels
+    Write-Host "  AVAILABLE MODELS ($($available.Count))" -ForegroundColor Cyan
+    Write-Host $divider -ForegroundColor DarkGray
+
+    if ($available.Count -eq 0) {
+        Write-Host "  (no models installed)" -ForegroundColor DarkGray
+    } else {
+        foreach ($model in $available) {
+            $isActive = $running | Where-Object { $_.name -eq $model.name }
+            $indicator = if ($isActive) { "[ACTIVE]" } else { "        " }
+            $color = if ($isActive) { "Green" } else { "Gray" }
+            $size = Format-Bytes $model.size
+
+            Write-Host "  $indicator " -ForegroundColor $color -NoNewline
+            Write-Host "$($model.name)" -ForegroundColor White -NoNewline
+            Write-Host "  ($size)" -ForegroundColor DarkGray
+        }
+    }
+
+    # Event history section
+    if ($script:RequestHistory.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  EVENT LOG (last $([Math]::Min(10, $script:RequestHistory.Count)))" -ForegroundColor Magenta
+        Write-Host $divider -ForegroundColor DarkGray
+
+        $recent = $script:RequestHistory | Select-Object -Last 10
+        foreach ($entry in $recent) {
+            $time = $entry.Time.ToString("HH:mm:ss")
+            $eventColor = if ($entry.Event -eq "LOADED") { "Green" } else { "DarkYellow" }
+            $details = if ($entry.Details) { " - $($entry.Details)" } else { "" }
+            Write-Host "  [$time] " -ForegroundColor DarkGray -NoNewline
+            Write-Host "$($entry.Event)" -ForegroundColor $eventColor -NoNewline
+            Write-Host " $($entry.Model)$details" -ForegroundColor White
+        }
+    }
+
+    Write-Host ""
 }
 
-# Main entry point
+# Main loop
 try {
-    Clear-Screen
-    Start-Monitoring
-}
-catch {
-    Write-Host "Error: $_" -ForegroundColor Red
-    Write-Host "Please check the error and try again." -ForegroundColor Yellow
+    [Console]::CursorVisible = $false
+
+    while ($true) {
+        $status = Get-OllamaStatus
+
+        if ($status.Online) {
+            Update-RequestHistory -RunningModels $status.RunningModels
+        }
+
+        Write-Dashboard -Status $status
+        Start-Sleep -Seconds $RefreshInterval
+    }
+} catch {
+    if ($_.Exception -is [System.Management.Automation.PipelineStoppedException] -or
+        $_.Exception.InnerException -is [System.OperationCanceledException]) {
+        # Ctrl+C - graceful exit
+    } else {
+        Write-Host "Error: $_" -ForegroundColor Red
+    }
+} finally {
+    [Console]::CursorVisible = $true
+    Write-Host ""
+    Write-Host "Monitor stopped." -ForegroundColor Yellow
 }
