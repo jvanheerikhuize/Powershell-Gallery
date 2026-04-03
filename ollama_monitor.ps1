@@ -65,7 +65,7 @@ function Monitor-Request {
     Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
     Write-Host ""
     
-    # Send request to Ollama
+    # Send request to Ollama with streaming
     $response = Invoke-RestMethod -Uri "$OllamaHost/api/generate" -Method Post -ContentType "application/json" -Body @{
         model = $Model
         prompt = $Prompt
@@ -74,15 +74,13 @@ function Monitor-Request {
     
     # Process streaming response
     $output = ""
-    $stream = $response.Stream
+    $elapsed = (Get-Date) - $startTime
+    $elapsedStr = [math]::Round($elapsed.TotalSeconds, 2)
     
-    if ($stream) {
-        $stream | ForEach-Object {
+    if ($response.Stream) {
+        $response.Stream | ForEach-Object {
             $data = $_ | ConvertFrom-Json
             $output += $data.Response
-            $elapsed = (Get-Date) - $startTime
-            $elapsedStr = [math]::Round($elapsed.TotalSeconds, 2)
-            
             Write-Host "  [STREAMING] $output" -ForegroundColor Green -NoNewline
             Write-Host "  (elapsed: $elapsedStr s)" -ForegroundColor Gray
             Start-Sleep -Milliseconds 10
@@ -90,9 +88,6 @@ function Monitor-Request {
     }
     else {
         $output = $response.Response
-        $elapsed = (Get-Date) - $startTime
-        $elapsedStr = [math]::Round($elapsed.TotalSeconds, 2)
-        
         Write-Host "  [COMPLETE] $output" -ForegroundColor Green
         Write-Host "  (elapsed: $elapsedStr s)" -ForegroundColor Gray
     }
