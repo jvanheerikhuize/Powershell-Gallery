@@ -74,9 +74,12 @@ function Get-OllamaGenerationStatus {
 
 function Format-Bytes {
     param([long]$Bytes)
-    if ($Bytes -ge 1GB) { return "{0:N1} GB" -f ($Bytes / 1GB) }
-    if ($Bytes -ge 1MB) { return "{0:N1} MB" -f ($Bytes / 1MB) }
-    if ($Bytes -ge 1KB) { return "{0:N1} KB" -f ($Bytes / 1KB) }
+    $oneGB = 1024 * 1024 * 1024
+    $oneMB = 1024 * 1024
+    $oneKB = 1024
+    if ($Bytes -ge $oneGB) { return "{0:N1} GB" -f ($Bytes / $oneGB) }
+    if ($Bytes -ge $oneMB) { return "{0:N1} MB" -f ($Bytes / $oneMB) }
+    if ($Bytes -ge $oneKB) { return "{0:N1} KB" -f ($Bytes / $oneKB) }
     return "$Bytes B"
 }
 
